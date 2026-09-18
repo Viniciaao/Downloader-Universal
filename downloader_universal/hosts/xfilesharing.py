@@ -15,7 +15,10 @@ caça o link direto na resposta.
 
 from __future__ import annotations
 
+import hashlib
+import os
 import re
+import tempfile
 import time
 from urllib.parse import urljoin, urlparse
 
@@ -69,6 +72,97 @@ PADROES_COUNTDOWN = [
 ]
 
 RE_FORM_XFS = re.compile(r'name=["\']?op["\']?\s+value=["\']download', re.I)
+
+#: Mensagens de erro típicas do XFS -> explicação amigável.
+#: Ordem importa: a primeira que casar é usada.
+PADROES_ERRO = [
+    (re.compile(r"file\s+not\s+found|no\s+such\s+file|file\s+was\s+deleted|"
+                r"file\s+(?:has\s+been\s+)?removed|arquivo\s+n[ãa]o\s+encontrado",
+                re.I),
+     "O arquivo não existe mais (foi removido ou o link expirou)."),
+    (re.compile(r"you\s+have\s+to\s+wait\s+(?:(\d+)\s*(minute|hour|second)s?"
+                r"(?:[^.]*?(\d+)\s*(minute|hour|second)s?)?)", re.I),
+     "O site exige espera entre downloads gratuitos{detalhe}. "
+     "Aguarde e tente de novo, ou troque de IP."),
+    (re.compile(r"you\s+can\s+download\s+files\s+up\s+to|"
+                r"available\s+only\s+for\s+premium|premium\s+(?:users|members)\s+only|"
+                r"become\s+premium|this\s+file\s+is\s+available\s+only", re.I),
+     "Este arquivo só pode ser baixado com conta premium do site."),
+    (re.compile(r"expired\s+session|security\s+error|session\s+expired|"
+                r"invalid\s+(?:file\s+)?(?:link|url)", re.I),
+     "A sessão expirou ou o site recusou a requisição (proteção anti-bot). "
+     "Tente novamente daqui a alguns minutos."),
+    (re.compile(r"skipped\s+countdown|wrong\s+captcha|captcha\s+error", re.I),
+     "O site recusou a etapa de verificação (captcha/contagem regressiva)."),
+    (re.compile(r"daily\s+download\s+limit|download\s+limit\s+exceeded|"
+                r"limite\s+di[áa]rio", re.I),
+     "Limite diário de downloads gratuitos atingido para este IP."),
+    (re.compile(r"ip\s+address.{0,40}(?:already|another)\s+download|"
+                r"another\s+download.{0,40}in\s+progress", re.I),
+     "Já existe outro download em andamento a partir deste IP. "
+     "Termine/cancele o outro e tente de novo."),
+]
+
+PADROES_CAPTCHA = [
+    (re.compile(r"g-recaptcha|recaptcha/api", re.I), "reCAPTCHA (Google)"),
+    (re.compile(r"h-captcha|hcaptcha\.com", re.I), "hCaptcha"),
+    (re.compile(r"turnstile|challenges\.cloudflare\.com", re.I),
+     "Cloudflare Turnstile"),
+    (re.compile(r'<input[^>]+name=["\']code["\']', re.I),
+     "captcha de dígitos do XFS"),
+    (re.compile(r"padding-left:\s*\d+px;\s*padding-top:\s*\d+px", re.I),
+     "captcha de dígitos posicionados por CSS"),
+]
+
+
+def mensagem_erro(html):
+    """Explicação amigável se o HTML contiver um erro conhecido do XFS."""
+    texto = re.sub(r"<script.*?</script>|<style.*?</style>", " ", html or "",
+                   flags=re.I | re.S)
+    texto = re.sub(r"<[^>]+>", " ", texto)
+    texto = re.sub(r"\s+", " ", texto)
+    for padrao, explicacao in PADROES_ERRO:
+        m = padrao.search(texto)
+        if not m:
+            continue
+        grupos = list(m.groups())
+        unidades = {"second": "segundos", "minute": "minutos",
+                    "hour": "horas"}
+        partes = [f"{grupos[i]} "
+                  f"{unidades.get(grupos[i + 1].lower(), grupos[i + 1])}"
+                  for i in range(0, len(grupos) - 1, 2)
+                  if grupos[i] and grupos[i + 1]]
+        detalhe = " (" + " e ".join(partes) + ")" if partes else ""
+        return explicacao.format(detalhe=detalhe)
+    return None
+
+
+def detectar_captcha(html):
+    """Nome do captcha presente na página, ou None."""
+    for padrao, nome in PADROES_CAPTCHA:
+        if padrao.search(html or ""):
+            return nome
+    return None
+
+
+def _assinatura(html):
+    """Assinatura do conteúdo útil da página (para detectar repetição)."""
+    corpo = re.sub(r"\s+", " ", html or "")
+    # remove tokens que mudam a cada requisição (rand, csrf, etc.)
+    corpo = re.sub(r'value=["\'][0-9a-f]{8,}["\']', "", corpo, flags=re.I)
+    return hashlib.sha1(corpo.encode("utf-8", "replace")).hexdigest()
+
+
+def _salvar_diagnostico(html, url):
+    """Salva o último HTML para inspeção; devolve o caminho (ou None)."""
+    try:
+        destino = os.path.join(tempfile.gettempdir(),
+                               f"xfs_debug_{abs(hash(url)) % 10**8}.html")
+        with open(destino, "w", encoding="utf-8", errors="replace") as fh:
+            fh.write(html or "")
+        return destino
+    except OSError:
+        return None
 
 
 def candidatos(html, base_url):
@@ -129,6 +223,9 @@ def baixar_xfs(url, pasta, *, sess=None, html_inicial=None, force=False):
 
     html = html_inicial
     url_atual = url
+    motivo = None          # explicação específica encontrada na página
+    assinaturas = []       # para detectar páginas repetidas (loop)
+
     for etapa in range(1, 8):
         if html is None:
             resp = sess.get(url_atual, timeout=CONFIG["timeout"],
@@ -136,6 +233,12 @@ def baixar_xfs(url, pasta, *, sess=None, html_inicial=None, force=False):
             resp.raise_for_status()
             html = resp.text
             url_atual = str(resp.url)
+
+        # 0) A página informa algum erro conhecido do XFS?
+        erro = mensagem_erro(html)
+        if erro:
+            motivo = erro
+            break
 
         # 1) Já existe link direto na página?
         for link in candidatos(html, url_atual):
@@ -148,8 +251,28 @@ def baixar_xfs(url, pasta, *, sess=None, html_inicial=None, force=False):
         # 2) Existe formulário de próxima etapa?
         formularios = formularios_download(html)
         if not formularios:
+            captcha = detectar_captcha(html)
+            if captcha:
+                motivo = (f"A página exige verificação por {captcha}, "
+                          "que não pode ser resolvida automaticamente.")
             break
         formulario = formularios[0]
+
+        # 3) A página é a mesma da etapa anterior? Então estamos em loop.
+        assinatura = _assinatura(html)
+        if assinatura in assinaturas:
+            captcha = detectar_captcha(html)
+            if captcha:
+                motivo = (f"O site repetiu a mesma página: ela exige "
+                          f"{captcha}, que não pode ser resolvido "
+                          "automaticamente.")
+            else:
+                motivo = ("O site devolveu a mesma página de formulário duas "
+                          "vezes seguidas (etapa " f"{etapa}"
+                          "). Normalmente isso significa verificação "
+                          "anti-bot, espera obrigatória ou sessão recusada.")
+            break
+        assinaturas.append(assinatura)
 
         espera = countdown(html)
         if espera:
@@ -165,11 +288,15 @@ def baixar_xfs(url, pasta, *, sess=None, html_inicial=None, force=False):
         html = resp.text
         url_atual = str(resp.url)
 
-    raise DownloadError(
-        f"Não consegui extrair o link direto de {url}. "
-        "O site pode ter mudado o formato da página, o arquivo pode ter sido "
-        "removido ou pode exigir conta premium."
-    )
+    if motivo is None:
+        motivo = ("Percorri todas as etapas e nenhuma página trouxe o link "
+                  "direto. O site pode ter mudado o formato da página.")
+
+    partes = [f"Não consegui baixar {url}.", motivo]
+    caminho = _salvar_diagnostico(html, url)
+    if caminho and CONFIG.get("verbose", True):
+        partes.append(f"HTML da última página salvo em: {caminho}")
+    raise DownloadError(" ".join(partes))
 
 
 class XFileSharing:
