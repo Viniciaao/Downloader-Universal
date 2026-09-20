@@ -16,9 +16,8 @@ Este módulo:
     (nome/tamanho/status) e falhar cedo com uma mensagem clara quando o
     arquivo foi removido ou bloqueado por DMCA;
   * percorre o fluxo de página via :func:`baixar_xfs` (motor XFS);
-  * quando o bloqueio é o Cloudflare Turnstile, dá a mensagem final com
-    saídas práticas (navegador + extensão oficial, IP residencial, conta
-    Ultimate).
+  * quando há bloqueio por captcha/contador, orienta a concluir o download
+    no navegador, sem prometer suporte premium ou resolução automática.
 
 A chave da API pública é a mesma usada pelo plugin do pyLoad
 (``DdownloadCom``) — serve apenas para consultar metadados de arquivos
@@ -53,16 +52,19 @@ API_CHAVE_PUBLICA = "37699zuaj90n9hxado2m7"
 #: URL do tipo https://ddownload.com/<código de 12 letras e números>[/nome]
 RE_CODIGO = re.compile(r"/([a-z0-9]{12})(?:/[^/?#]*)?(?:[?#]|$)", re.I)
 
+DICA_VERIFICACAO = (
+    "O download gratuito do DDownload pode exigir captcha e espera. "
+    "Este projeto não resolve desafios de navegador automaticamente.\n"
+    "Abra o link original no navegador e conclua o download por lá. "
+    "Rodar em uma conexão residencial pode mudar a resposta do site, "
+    "mas não garante que o captcha desapareça.\n"
+    "A consulta à API pública só lê metadados: ela não libera o download. "
+    "Este projeto ainda não implementa autenticação premium do DDownload."
+)
+
 DICA_TURNSTILE = (
-    "O DDownload protege o download com Cloudflare Turnstile, um desafio "
-    "que exige um navegador real; automação pura (como este script) costuma "
-    "ser barrada quando o IP é de datacenter (Colab, VPS, nuvem).\n"
-    "Saídas práticas:\n"
-    "  1. Baixar pelo navegador, de preferência com a extensão oficial do "
-    "DDownload (Chrome/Firefox) ou o app (Android/iOS/TV);\n"
-    "  2. Rodar este projeto em uma conexão residencial (IP 'limpo'), onde "
-    "o desafio costuma passar sozinho e o fluxo XFS funciona;\n"
-    "  3. Usar a conta Ultimate (premium), que remove captchas e esperas."
+    "A página exige Cloudflare Turnstile, que precisa de um navegador "
+    "para executar a verificação.\n" + DICA_VERIFICACAO
 )
 
 
@@ -158,4 +160,6 @@ class DDownload:
             msg = str(exc)
             if "Turnstile" in msg:
                 raise DownloadError(f"{msg}\n\n💡 {DICA_TURNSTILE}") from exc
+            if "captcha" in msg.lower() or "contagem regressiva" in msg.lower():
+                raise DownloadError(f"{msg}\n\n💡 {DICA_VERIFICACAO}") from exc
             raise
