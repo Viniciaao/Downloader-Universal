@@ -12,6 +12,11 @@ import types
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from downloader_universal import hosts  # noqa: E402
+from downloader_universal.hosts.ddownload import (  # noqa: E402
+    DDownload,
+    extrair_codigo,
+    info_arquivo,
+)
 from downloader_universal.hosts.mediafire import MediaFire, _extrair_link  # noqa: E402
 from downloader_universal.hosts.xfilesharing import (  # noqa: E402
     candidatos,
@@ -19,6 +24,7 @@ from downloader_universal.hosts.xfilesharing import (  # noqa: E402
     detectar_captcha,
     formularios_download,
     mensagem_erro,
+    tempo_espera_segundos,
 )
 from downloader_universal.utils import (  # noqa: E402
     dominio,
@@ -122,13 +128,115 @@ checar("xfs: candidatos com extensão têm prioridade",
                   '<a href="https://srv.com/f/arquivo.rar">baixar</a>',
                   "https://site.com")[0].endswith("arquivo.rar"))
 
+# --------------------------------------------------------------- DDownload
+PAGINA_DDL_NOVA = '''
+<html><body>
+<h2>toni_head128_X_8bit.png</h2>
+<div id="countdown">
+  <span class="seconds">60</span>
+  Please wait before downloading
+</div>
+<form method="post" action="">
+<input type="hidden" name="op" value="download1">
+<input type="hidden" name="id" value="h2v6slabi0bi">
+<input type="hidden" name="fname" value="toni_head128_X_8bit.png">
+<button class="downloadbtn" type="submit">Regular Download</button>
+</form>
+</body></html>
+'''
+
+checar("ddl: código com nome no final",
+       extrair_codigo("https://ddownload.com/h2v6slabi0bi/toni_head128_X_8bit.png")
+       == "h2v6slabi0bi")
+checar("ddl: código sem nome",
+       extrair_codigo("https://ddownload.com/np1a29n1w47q") == "np1a29n1w47q")
+checar("ddl: código no domínio antigo (ddl.to)",
+       extrair_codigo("https://www.ddl.to/abcdef123456") == "abcdef123456")
+checar("ddl: URL sem código retorna None",
+       extrair_codigo("https://ddownload.com/upload") is None)
+
+# Layout novo: contador em <div id="countdown"> + <span class="seconds">.
+checar("ddl: countdown do layout novo (60s)",
+       countdown(PAGINA_DDL_NOVA) == 60)
+
+forms_ddl = formularios_download(PAGINA_DDL_NOVA)
+checar("ddl: acha formulário do layout novo", len(forms_ddl) == 1)
+checar("ddl: injeta method_free quando o botão perdeu o name",
+       forms_ddl and forms_ddl[0]["campos"].get("method_free") == ""
+       and forms_ddl[0]["campos"].get("op") == "download1")
+
+checar("ddl: offline do layout novo ('no longer available')",
+       "não existe mais" in (mensagem_erro(
+           "<h1>File Not Found</h1>"
+           "<p>The file you're looking for is no longer available.</p>") or ""))
+checar("ddl: arquivo banido por copyright (DMCA)",
+       "DMCA" in (mensagem_erro(
+           "<p>This file was banned by copyright owner's report</p>") or ""))
+checar("ddl: manutenção",
+       "manutenção" in (mensagem_erro(
+           "<b>This server is in maintenance mode</b>") or ""))
+
+checar("ddl: espera '3 minutes, 20 seconds' = 200s",
+       tempo_espera_segundos(
+           "<p>You have to wait 3 minutes, 20 seconds till next download</p>"
+       ) == 200)
+checar("ddl: espera '60 seconds' = 60s",
+       tempo_espera_segundos("<p>You have to wait 60 seconds</p>") == 60)
+checar("ddl: sem mensagem de espera retorna None",
+       tempo_espera_segundos(PAGINA_XFS_1) is None)
+
+# API pública (sessão falsa, sem rede).
+class _RespFalso:
+    def __init__(self, dados):
+        self._dados = dados
+
+    def json(self):
+        return self._dados
+
+
+class _SessaoFalsa:
+    def __init__(self, resp=None, exc=None):
+        self._resp = resp
+        self._exc = exc
+        self.chamadas = []
+
+    def get(self, url, **kwargs):
+        self.chamadas.append((url, kwargs))
+        if self._exc is not None:
+            raise self._exc
+        return self._resp
+
+
+import json as _json  # noqa: E402
+import requests as _requests  # noqa: E402
+
+API_OK = _json.loads('{"msg":"OK","status":200,"result":[{"filecode":'
+                     '"h2v6slabi0bi","name":"toni_head128_X_8bit.png",'
+                     '"size":9120,"status":200,'
+                     '"uploaded":"2026-09-20 21:33:18"}]}')
+API_404 = {"msg": "OK", "status": 200,
+           "result": [{"status": 404, "filecode": "zzzzzzzzzzzz"}]}
+
+checar("ddl: info_arquivo lê nome/tamanho",
+       info_arquivo(_SessaoFalsa(_RespFalso(API_OK)), "h2v6slabi0bi")
+       == {"filecode": "h2v6slabi0bi", "name": "toni_head128_X_8bit.png",
+           "size": 9120, "status": 200, "uploaded": "2026-09-20 21:33:18"})
+checar("ddl: info_arquivo preserva status 404 do arquivo",
+       (info_arquivo(_SessaoFalsa(_RespFalso(API_404)), "zzzzzzzzzzzz")
+        or {}).get("status") == 404)
+checar("ddl: API fora do ar -> None (não quebra o fluxo)",
+       info_arquivo(_SessaoFalsa(exc=_requests.exceptions.ConnectionError("x")),
+                    "h2v6slabi0bi") is None)
+
 # ------------------------------------------------------------ Detecção host
 checar("detecta mediafire",
        hosts.detectar("https://www.mediafire.com/file/x/y.rar/file") is MediaFire)
 checar("detecta sharemods como XFS",
        hosts.detectar("https://sharemods.com/abc/arquivo.zip.html").NOME.startswith("XFileSharing"))
-checar("detecta ddownload como XFS",
-       hosts.detectar("https://ddownload.com/abc/arquivo.rar").NOME.startswith("XFileSharing"))
+checar("detecta ddownload com o extrator dedicado",
+       hosts.detectar("https://ddownload.com/h2v6slabi0bi/arquivo.png") is DDownload)
+checar("detecta ddl.to (domínio antigo) como DDownload",
+       hosts.detectar("https://ddl.to/abc123456789") is DDownload)
 checar("detecta drive.google.com",
        hosts.detectar("https://drive.google.com/file/d/abc/view").NOME == "Google Drive")
 checar("detecta rapidgator",
