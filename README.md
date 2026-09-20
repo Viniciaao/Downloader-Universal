@@ -24,7 +24,7 @@ Baixa arquivos dos sites de hospedagem mais comuns da internet — direto no
 | **MediaFire** | ✅ | Arquivos e pastas, sem precisar de conta |
 | **Google Drive** | ✅ | Arquivos e pastas compartilhados como "Qualquer pessoa com o link" |
 | **Sharemods** | ✅ | Download grátis, espera automática do contador |
-| **DDownload** (ex-dll.to) | ✅ | Extrator próprio: pré-leitura pela API pública (nome/tamanho/status) + fluxo XFS com contador e espera automática. Em IPs de datacenter (Colab/VPS) o **Cloudflare Turnstile** pode barrar a automação — em conexão residencial funciona |
+| **DDownload** (ex-dll.to) | 🔶 | API de metadados + fluxo XFS com contador. Captchas exigem navegador; não há garantia em conexão residencial nem autenticação premium implementada |
 | **RapidGator** | 🔶 | Requer **conta premium** (o modo grátis usa captcha e bloqueia automação) |
 | **MEGA** | ✅* | Instale o suporte opcional: `pip install mega.py` |
 | **OneDrive / 1drv.ms** | ✅ | Links públicos de compartilhamento |
@@ -34,7 +34,8 @@ Baixa arquivos dos sites de hospedagem mais comuns da internet — direto no
 
 > **XFS (XFileSharing)** é o script usado por centenas de sites de hospedagem.
 > Se a página tiver os formulários típicos (`op=download1`/`download2`), o
-> motor genérico resolve sozinho — mesmo sem o site estar na lista.
+> motor genérico tenta seguir as etapas — mesmo sem o site estar na lista.
+> Captchas e verificações de navegador não são resolvidos automaticamente.
 > O motor XFS também lida com o passo final por **redirect** (o link direto
 > no cabeçalho `Location`, como o DDownload faz hoje) e com o contador do
 > layout novo (`<div id="countdown">` + `<span class="seconds">`).
@@ -111,14 +112,44 @@ baixar("https://sharemods.com/abcdef/mod.zip.html", pasta="meus_arquivos")
 
 | Problema | Solução |
 |---|---|
-| DDownload: `exige verificação por Cloudflare Turnstile` | O desafio exige navegador real; em IP de datacenter (Colab/VPS) a automação costuma ser barrada. Baixe pelo navegador com a **extensão oficial do DDownload** (Chrome/Firefox) ou o app, rode este projeto em conexão **residencial**, ou use a conta **Ultimate** (premium) |
-| DDownload: `erro de rede/SSL` no handshake TLS | O IP de origem está sendo bloqueado pelo provedor (comum em datacenters) — troque de rede/VPN ou baixe por outro meio |
+| DDownload: captcha / `Cloudflare Turnstile` | Abra o link original no navegador e conclua o download por lá. A API pública só consulta metadados; não resolve captchas. IP residencial não garante sucesso e o projeto não implementa login premium do DDownload |
+| DDownload aparece como `XFileSharing` no log | Código antigo em disco ou na memória do Colab. Atualize o projeto e reinicie a sessão, conforme as instruções abaixo |
+| `skipped countdown` | O servidor recusou a contagem regressiva; não significa necessariamente captcha. Atualize o projeto. Se persistir, o HTML de diagnóstico ajuda a identificar o contador ou a verificação de sessão não reconhecidos |
+| DDownload: `erro de rede/SSL` no handshake TLS | Pode ser bloqueio de IP ou instabilidade de rede/servidor; esse erro, sozinho, não prova a causa. Tente mais tarde ou abra no navegador |
 | `RapidGator bloqueia download automático` | É necessário conta **premium** + `configurar(rapidgator_usuario=..., rapidgator_senha=...)` |
 | Google Drive: `Access denied` | O dono do arquivo precisa compartilhar como "Qualquer pessoa com o link" |
 | `Não consegui extrair o link direto` | O arquivo pode ter sido removido ou o site mudou — abra uma [issue](../../issues) com o link |
 | MEGA: módulo não instalado | `pip install mega.py` |
 | Download lento no Colab | Normal: depende do servidor de origem e da cota da sua conta |
 | Sessão do Colab expirou | Os arquivos em `/content` são apagados; sempre mova para o Drive |
+
+### Atualizar uma sessão antiga do Colab
+
+`git pull` não recarrega módulos Python que já foram importados. Em uma
+célula do notebook antigo, execute:
+
+```python
+!git -C /content/Downloader-Universal pull --ff-only
+```
+
+Confirme que o comando terminou sem erro. Depois use **Ambiente de execução
+▸ Reiniciar sessão** (não excluir o ambiente) e execute as células novamente,
+incluindo suas configurações. O SETUP do notebook atualizado usa caminho
+absoluto e avisa quando é necessário reiniciar, evitando outro clone dentro
+da pasta do projeto.
+
+Para o link do DDownload, o log atualizado deve mostrar
+`site detectado: DDownload (ex-dll.to)`, não `XFileSharing`. Isso confirma o
+extrator, mas não garante que o site libere o arquivo.
+
+O contador é respeitado integralmente, com margem de 2 segundos. Se exceder
+`max_espera_download` (padrão: 180s), o programa para sem enviar o formulário
+antecipadamente. Para permitir uma espera maior, use, por exemplo,
+`configurar(max_espera_download=300)`.
+
+Se a falha persistir, o HTML salvo em `/tmp/xfs_debug_*.html` pode ajudar no
+diagnóstico. Ele pertence à sessão em que ocorreu o erro; revise e remova
+cookies, tokens e dados pessoais antes de compartilhá-lo.
 
 ## ⚖️ Aviso legal
 
@@ -131,6 +162,7 @@ responsabilidade do usuário.
 
 ```bash
 python tests/test_parsers.py   # testes offline dos parsers (sem rede)
+python -m unittest discover -s tests -p "test_fluxo_xfs.py" -v
 ```
 
 ## 📄 Licença

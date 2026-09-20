@@ -69,7 +69,8 @@ PADROES_LINK = [
 PADROES_COUNTDOWN = [
     re.compile(r'id=["\']countdown_str["\'][^>]*>\s*(\d+)', re.I),
     re.compile(r'id=["\']countdown["\'][^>]*(?:value=["\']|>)\s*(\d+)', re.I),
-    re.compile(r'var\s+wait\s*=\s*(\d+)', re.I),
+    re.compile(r'(?:var|let|const)\s+(?:wait|seconds)\s*=\s*(\d+)', re.I),
+    re.compile(r'\bcountdown\s*\(\s*(\d+)\s*\)', re.I),
 ]
 
 RE_FORM_XFS = re.compile(r'name=["\']?op["\']?\s+value=["\']download', re.I)
@@ -101,8 +102,12 @@ PADROES_ERRO = [
                 r"invalid\s+(?:file\s+)?(?:link|url)", re.I),
      "A sessão expirou ou o site recusou a requisição (proteção anti-bot). "
      "Tente novamente daqui a alguns minutos."),
-    (re.compile(r"skipped\s+countdown|wrong\s+captcha|captcha\s+error", re.I),
-     "O site recusou a etapa de verificação (captcha/contagem regressiva)."),
+    (re.compile(r"skipped\s+countdown", re.I),
+     "O site recusou a contagem regressiva (skipped countdown). "
+     "A espera pode não ter sido detectada ou a sessão pode ter expirado."),
+    (re.compile(r"wrong\s+captcha|captcha\s+error|invalid\s+captcha", re.I),
+     "O site recusou o captcha: a verificação está ausente, inválida ou expirou. "
+     "Abra o link no navegador para concluir a verificação."),
     (re.compile(r"daily\s+download\s+limit|download\s+limit\s+exceeded|"
                 r"limite\s+di[áa]rio", re.I),
      "Limite diário de downloads gratuitos atingido para este IP."),
@@ -236,23 +241,40 @@ def candidatos(html, base_url):
 
 
 def countdown(html):
-    """Segundos de espera exigidos pelo site (0 se não houver)."""
-    # Layout novo (2025+, usado por DDownload):
-    # <div id="countdown"> ... <span class="seconds">60</span> ...
-    # O elemento é sinal explícito de UI; checa primeiro. (Nos layouts
-    # antigos o id="countdown" costuma ser um <input value="N">, sem texto —
-    # nesse caso cai nos padrões abaixo.)
-    alvo = BeautifulSoup(html or "", "html.parser").find(
-        id=re.compile(r"countdown", re.I))
-    if alvo is not None:
-        numeros = re.findall(r"\d+", alvo.get_text(" ", strip=True))
-        if numeros:
-            return min(int(numeros[0]), 120)
+    """Segundos exigidos pelo site, sem encurtar a espera (0 se ausente)."""
+    sopa = BeautifulSoup(html or "", "html.parser")
+    tempos = []
+    for alvo in sopa.find_all(id=re.compile(r"countdown", re.I)):
+        # O layout novo pode incluir outros números no texto da UI.
+        segundos = alvo.select_one(".seconds")
+        texto = (segundos.get_text(strip=True) if segundos is not None
+                 else alvo.get("value") or alvo.get_text(" ", strip=True))
+        numeros = re.findall(r"\d+", texto)
+        if len(numeros) == 1:
+            tempos.append(int(numeros[0]))
     for padrao in PADROES_COUNTDOWN:
-        m = padrao.search(html)
-        if m:
-            return min(int(m.group(1)), 120)
-    return 0
+        tempos.extend(int(m.group(1)) for m in padrao.finditer(html or ""))
+    return max(tempos, default=0)
+
+
+CAMPOS_CAPTCHA = {
+    "cf-turnstile-response": ("cf-turnstile", "Cloudflare Turnstile"),
+    "g-recaptcha-response": ("g-recaptcha", "reCAPTCHA (Google)"),
+    "h-captcha-response": ("h-captcha", "hCaptcha"),
+    "code": (None, "captcha de dígitos do XFS"),
+}
+
+
+def captcha_pendente(html, campos):
+    """Detecta desafio sem resposta; um script carregado, sozinho, não basta."""
+    sopa = BeautifulSoup(html or "", "html.parser")
+    for campo, (classe, nome) in CAMPOS_CAPTCHA.items():
+        if str(campos.get(campo, "")).strip():
+            continue
+        if ((classe and sopa.find(class_=classe) is not None)
+                or campo in campos):
+            return nome
+    return None
 
 
 def formularios_download(html):
@@ -261,13 +283,15 @@ def formularios_download(html):
     formularios = []
     for form in sopa.find_all("form"):
         campos = {}
-        for inp in form.find_all(["input", "button"]):
+        for inp in form.find_all(["input", "button", "textarea"]):
             nome = inp.get("name")
             if not nome:
                 continue
             tipo = (inp.get("type") or "text").lower()
-            valor = inp.get("value") or ""
+            valor = (inp.get_text() if inp.name == "textarea"
+                     else inp.get("value") or "")
             if (tipo in ("hidden", "submit", "button")
+                    or nome in CAMPOS_CAPTCHA
                     or nome.lower() in {"op", "id", "rand", "referer", "fname",
                                         "method_free", "method_premium"}):
                 campos[nome] = valor
@@ -374,10 +398,23 @@ def baixar_xfs(url, pasta, *, sess=None, html_inicial=None, force=False,
             break
         assinaturas.append(assinatura)
 
+        captcha = captcha_pendente(html, formulario["campos"])
+        if captcha:
+            motivo = (f"A página exige verificação por {captcha}. "
+                      "O formulário não foi enviado sem a resposta do captcha; "
+                      "abra o link no navegador para concluir a verificação.")
+            break
+
         espera = countdown(html)
+        if espera > int(CONFIG["max_espera_download"]):
+            motivo = (f"O contador exige {espera}s, acima do limite configurado "
+                      f"({CONFIG['max_espera_download']}s). O formulário não foi "
+                      "enviado antes da hora. Aumente max_espera_download "
+                      "com configurar() se quiser aguardar esse tempo.")
+            break
         if espera:
             log(f"⏳ Aguardando {espera}s (exigência do site)...")
-            time.sleep(espera)
+            time.sleep(espera + 2)
 
         alvo = urljoin(url_atual, formulario["action"]) or url_atual
         log(f"   ↳ etapa {etapa}: enviando formulário "

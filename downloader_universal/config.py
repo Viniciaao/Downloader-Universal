@@ -17,9 +17,9 @@ CONFIG = {
     "timeout": 30,
     # Tentativas de download em caso de queda de conexão.
     "retries": 3,
-    # Teto (segundos) para espera de "cooldown" entre downloads gratuitos
+    # Teto (segundos) para contadores e espera entre downloads gratuitos
     # ("You have to wait N ..."): o programa aguarda e tenta de novo
-    # sozinho, no máximo 2 vezes.
+    # sozinho, no máximo 2 vezes. Contadores acima do teto não são enviados.
     "max_espera_download": 180,
     # Mostra mensagens de status.
     "verbose": True,
