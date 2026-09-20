@@ -16,7 +16,9 @@ from downloader_universal.hosts.mediafire import MediaFire, _extrair_link  # noq
 from downloader_universal.hosts.xfilesharing import (  # noqa: E402
     candidatos,
     countdown,
+    detectar_captcha,
     formularios_download,
+    mensagem_erro,
 )
 from downloader_universal.utils import (  # noqa: E402
     dominio,
@@ -139,6 +141,47 @@ checar("detecta link direto",
        hosts.detectar("https://servidor.qualquer.com/pasta/mod.rar").NOME == "Link direto")
 checar("página desconhecida cai no genérico",
        hosts.detectar("https://site-desconhecido.com/pagina").NOME.startswith("Genérico"))
+
+# ------------------------------------------------- XFS: erros e captchas
+checar("xfs: arquivo removido",
+       "não existe mais" in (mensagem_erro(
+           "<html><body><b>File Not Found</b></body></html>") or ""))
+checar("xfs: arquivo deletado",
+       "não existe mais" in (mensagem_erro(
+           "<div>The file was deleted by its owner</div>") or ""))
+checar("xfs: espera obrigatória traz o tempo",
+       "3 minutos" in (mensagem_erro(
+           "<p>You have to wait 3 minutes, 20 seconds till next download</p>")
+           or ""))
+checar("xfs: somente premium",
+       "premium" in (mensagem_erro(
+           "<div>This file is available only for premium users</div>") or ""))
+checar("xfs: sessão expirada",
+       "sessão expirou" in (mensagem_erro(
+           "<b>Expired session</b>") or ""))
+checar("xfs: limite diário",
+       "Limite diário" in (mensagem_erro(
+           "<p>Daily download limit exceeded</p>") or ""))
+checar("xfs: página normal não vira erro",
+       mensagem_erro(PAGINA_XFS_1) is None,
+       f"retornou {mensagem_erro(PAGINA_XFS_1)!r}")
+checar("xfs: texto dentro de script é ignorado",
+       mensagem_erro("<script>var msg='File Not Found';</script><p>ok</p>")
+       is None)
+
+checar("xfs: detecta recaptcha",
+       detectar_captcha('<div class="g-recaptcha" data-sitekey="x"></div>')
+       == "reCAPTCHA (Google)")
+checar("xfs: detecta hcaptcha",
+       detectar_captcha('<div class="h-captcha"></div>') == "hCaptcha")
+checar("xfs: detecta turnstile",
+       detectar_captcha('<script src="https://challenges.cloudflare.com/x">'
+                        '</script>') == "Cloudflare Turnstile")
+checar("xfs: detecta captcha de dígitos",
+       detectar_captcha('<input type="text" name="code" maxlength="4">')
+       is not None)
+checar("xfs: página sem captcha",
+       detectar_captcha(PAGINA_XFS_1) is None)
 
 # ------------------------------------------------------------------- Utils
 checar("dominio sem www", dominio("https://www.mediafire.com/x") == "mediafire.com")
