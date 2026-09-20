@@ -24,7 +24,7 @@ Baixa arquivos dos sites de hospedagem mais comuns da internet — direto no
 | **MediaFire** | ✅ | Arquivos e pastas, sem precisar de conta |
 | **Google Drive** | ✅ | Arquivos e pastas compartilhados como "Qualquer pessoa com o link" |
 | **Sharemods** | ✅ | Download grátis, espera automática do contador |
-| **DDownload** | ✅ | Mesmo motor do Sharemods (XFileSharing) |
+| **DDownload** (ex-dll.to) | ✅ | Extrator próprio: pré-leitura pela API pública (nome/tamanho/status) + fluxo XFS com contador e espera automática. Em IPs de datacenter (Colab/VPS) o **Cloudflare Turnstile** pode barrar a automação — em conexão residencial funciona |
 | **RapidGator** | 🔶 | Requer **conta premium** (o modo grátis usa captcha e bloqueia automação) |
 | **MEGA** | ✅* | Instale o suporte opcional: `pip install mega.py` |
 | **OneDrive / 1drv.ms** | ✅ | Links públicos de compartilhamento |
@@ -35,6 +35,9 @@ Baixa arquivos dos sites de hospedagem mais comuns da internet — direto no
 > **XFS (XFileSharing)** é o script usado por centenas de sites de hospedagem.
 > Se a página tiver os formulários típicos (`op=download1`/`download2`), o
 > motor genérico resolve sozinho — mesmo sem o site estar na lista.
+> O motor XFS também lida com o passo final por **redirect** (o link direto
+> no cabeçalho `Location`, como o DDownload faz hoje) e com o contador do
+> layout novo (`<div id="countdown">` + `<span class="seconds">`).
 
 ## 🚀 Como usar no Google Colab
 
@@ -108,6 +111,8 @@ baixar("https://sharemods.com/abcdef/mod.zip.html", pasta="meus_arquivos")
 
 | Problema | Solução |
 |---|---|
+| DDownload: `exige verificação por Cloudflare Turnstile` | O desafio exige navegador real; em IP de datacenter (Colab/VPS) a automação costuma ser barrada. Baixe pelo navegador com a **extensão oficial do DDownload** (Chrome/Firefox) ou o app, rode este projeto em conexão **residencial**, ou use a conta **Ultimate** (premium) |
+| DDownload: `erro de rede/SSL` no handshake TLS | O IP de origem está sendo bloqueado pelo provedor (comum em datacenters) — troque de rede/VPN ou baixe por outro meio |
 | `RapidGator bloqueia download automático` | É necessário conta **premium** + `configurar(rapidgator_usuario=..., rapidgator_senha=...)` |
 | Google Drive: `Access denied` | O dono do arquivo precisa compartilhar como "Qualquer pessoa com o link" |
 | `Não consegui extrair o link direto` | O arquivo pode ter sido removido ou o site mudou — abra uma [issue](../../issues) com o link |

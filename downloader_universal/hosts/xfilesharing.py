@@ -22,6 +22,7 @@ import tempfile
 import time
 from urllib.parse import urljoin, urlparse
 
+import requests
 from bs4 import BeautifulSoup
 
 from ..config import CONFIG
@@ -30,9 +31,9 @@ from ..utils import log, parece_link_direto, sessao
 
 #: Sites conhecidos que usam XFS (outros são detectados automaticamente
 #: pelo extrator genérico quando a página contém formulários op=download).
+#: DDownload tem extrator próprio (hosts/ddownload.py) e foi removido daqui.
 DOMINIOS_XFS = {
     "sharemods.com",
-    "ddownload.com",
     "usersdrive.com",
     "uploadrar.com",
     "filefox.com",
@@ -77,13 +78,21 @@ RE_FORM_XFS = re.compile(r'name=["\']?op["\']?\s+value=["\']download', re.I)
 #: Ordem importa: a primeira que casar é usada.
 PADROES_ERRO = [
     (re.compile(r"file\s+not\s+found|no\s+such\s+file|file\s+was\s+deleted|"
-                r"file\s+(?:has\s+been\s+)?removed|arquivo\s+n[ãa]o\s+encontrado",
+                r"file\s+(?:has\s+been\s+)?removed|no\s+longer\s+available|"
+                r"cannot\s+be\s+accessed|"
+                r"arquivo\s+n[ãa]o\s+encontrado",
                 re.I),
      "O arquivo não existe mais (foi removido ou o link expirou)."),
+    (re.compile(r"banned\s+by\s+copyright|copyright\s+owner['’]s?\s+report|"
+                r"removed\s+(?:due\s+to|for)\s+(?:dmca|copyright)|\bdmca\b",
+                re.I),
+     "O arquivo foi removido por direitos autorais (DMCA)."),
     (re.compile(r"you\s+have\s+to\s+wait\s+(?:(\d+)\s*(minute|hour|second)s?"
                 r"(?:[^.]*?(\d+)\s*(minute|hour|second)s?)?)", re.I),
      "O site exige espera entre downloads gratuitos{detalhe}. "
      "Aguarde e tente de novo, ou troque de IP."),
+    (re.compile(r"maintenance\s+mode|server\s+is\s+in\s+maintenance", re.I),
+     "O servidor está em manutenção. Tente novamente em alguns minutos."),
     (re.compile(r"you\s+can\s+download\s+files\s+up\s+to|"
                 r"available\s+only\s+for\s+premium|premium\s+(?:users|members)\s+only|"
                 r"become\s+premium|this\s+file\s+is\s+available\s+only", re.I),
@@ -115,12 +124,17 @@ PADROES_CAPTCHA = [
 ]
 
 
-def mensagem_erro(html):
-    """Explicação amigável se o HTML contiver um erro conhecido do XFS."""
+def texto_puro(html):
+    """Texto visível do HTML (sem script/style), espremido em uma linha."""
     texto = re.sub(r"<script.*?</script>|<style.*?</style>", " ", html or "",
                    flags=re.I | re.S)
     texto = re.sub(r"<[^>]+>", " ", texto)
-    texto = re.sub(r"\s+", " ", texto)
+    return re.sub(r"\s+", " ", texto)
+
+
+def mensagem_erro(html):
+    """Explicação amigável se o HTML contiver um erro conhecido do XFS."""
+    texto = texto_puro(html)
     for padrao, explicacao in PADROES_ERRO:
         m = padrao.search(texto)
         if not m:
@@ -135,6 +149,44 @@ def mensagem_erro(html):
         detalhe = " (" + " e ".join(partes) + ")" if partes else ""
         return explicacao.format(detalhe=detalhe)
     return None
+
+
+def tempo_espera_segundos(html):
+    """Segundos pedidos pela mensagem 'you have to wait N ...' (ou None)."""
+    m = re.search(
+        r"you\s+have\s+to\s+wait\s+(?:(\d+)\s*(minutes?|hours?|seconds?)"
+        r"(?:\s*[,and]?\s*(\d+)\s*(minutes?|hours?|seconds?))?)",
+        texto_puro(html), re.I)
+    if not m:
+        return None
+
+    def em_segundos(num, unidade):
+        u = (unidade or "").lower()
+        if u.startswith("hour"):
+            mult = 3600
+        elif u.startswith("min"):
+            mult = 60
+        else:
+            mult = 1
+        return int(num) * mult
+
+    total = em_segundos(m.group(1), m.group(2))
+    if m.group(3):
+        total += em_segundos(m.group(3), m.group(4))
+    return total
+
+
+def erro_rede(exc, url):
+    """Mensagem amigável para falhas de rede/SSL ao falar com o site."""
+    msg = f"Não consegui falar com {url} (erro de rede/SSL)."
+    texto = str(exc)
+    if "SSL" in texto or "TLS" in texto:
+        msg += (" O servidor fechou a conexão durante o handshake TLS — "
+                "pode ser bloqueio de IP (comum em IPs de datacenter) "
+                "ou instabilidade temporária.")
+    if len(texto) > 300:
+        texto = texto[:300] + "…"
+    return f"{msg} Detalhe: {texto}"
 
 
 def detectar_captcha(html):
@@ -185,6 +237,17 @@ def candidatos(html, base_url):
 
 def countdown(html):
     """Segundos de espera exigidos pelo site (0 se não houver)."""
+    # Layout novo (2025+, usado por DDownload):
+    # <div id="countdown"> ... <span class="seconds">60</span> ...
+    # O elemento é sinal explícito de UI; checa primeiro. (Nos layouts
+    # antigos o id="countdown" costuma ser um <input value="N">, sem texto —
+    # nesse caso cai nos padrões abaixo.)
+    alvo = BeautifulSoup(html or "", "html.parser").find(
+        id=re.compile(r"countdown", re.I))
+    if alvo is not None:
+        numeros = re.findall(r"\d+", alvo.get_text(" ", strip=True))
+        if numeros:
+            return min(int(numeros[0]), 120)
     for padrao in PADROES_COUNTDOWN:
         m = padrao.search(html)
         if m:
@@ -211,13 +274,22 @@ def formularios_download(html):
         if str(campos.get("op", "")).lower().startswith("download"):
             if "method_free" in campos:
                 campos.pop("method_premium", None)
+            elif not any(k.lower().startswith("method_") for k in campos):
+                # Layout novo: o botão de download perdeu o name="method_free";
+                # o servidor espera o campo para distinguir free/premium.
+                campos["method_free"] = ""
             formularios.append({"action": form.get("action") or "",
                                 "campos": campos})
     return formularios
 
 
-def baixar_xfs(url, pasta, *, sess=None, html_inicial=None, force=False):
-    """Baixa um arquivo percorrendo as etapas XFS até achar o link direto."""
+def baixar_xfs(url, pasta, *, sess=None, html_inicial=None, force=False,
+               nome_arquivo=None):
+    """Baixa um arquivo percorrendo as etapas XFS até achar o link direto.
+
+    ``nome_arquivo`` (opcional) força o nome do arquivo final — útil quando
+    a API do site já informa o nome correto.
+    """
     sess = sess or sessao()
     sess.headers["Referer"] = url
 
@@ -225,18 +297,45 @@ def baixar_xfs(url, pasta, *, sess=None, html_inicial=None, force=False):
     url_atual = url
     motivo = None          # explicação específica encontrada na página
     assinaturas = []       # para detectar páginas repetidas (loop)
+    esperas_feitas = 0     # tentativas extras após "you have to wait N"
 
     for etapa in range(1, 8):
         if html is None:
-            resp = sess.get(url_atual, timeout=CONFIG["timeout"],
-                            allow_redirects=True)
-            resp.raise_for_status()
+            try:
+                resp = sess.get(url_atual, timeout=CONFIG["timeout"],
+                                allow_redirects=True)
+            except requests.exceptions.RequestException as exc:
+                raise DownloadError(erro_rede(exc, url_atual)) from exc
+            if resp.status_code == 404:
+                raise DownloadError(
+                    "O arquivo não existe mais (HTTP 404) — "
+                    "o link foi removido ou expirou.")
+            try:
+                resp.raise_for_status()
+            except requests.exceptions.HTTPError as exc:
+                raise DownloadError(
+                    f"O servidor devolveu HTTP {resp.status_code} "
+                    f"ao abrir {url_atual}."
+                ) from exc
             html = resp.text
             url_atual = str(resp.url)
 
         # 0) A página informa algum erro conhecido do XFS?
         erro = mensagem_erro(html)
         if erro:
+            # Erro de "espera": o site aceita o download depois de alguns
+            # minutos — aguarda e tenta de novo (máx. 2x, com teto).
+            espera_seg = tempo_espera_segundos(html)
+            if (espera_seg
+                    and espera_seg <= int(CONFIG["max_espera_download"])
+                    and esperas_feitas < 2):
+                esperas_feitas += 1
+                log(f"⏳ O site pediu espera de {espera_seg}s entre "
+                    f"downloads. Aguardando e tentando de novo "
+                    f"({esperas_feitas}/2)...")
+                time.sleep(espera_seg + 2)
+                html = None
+                continue
             motivo = erro
             break
 
@@ -244,6 +343,7 @@ def baixar_xfs(url, pasta, *, sess=None, html_inicial=None, force=False):
         for link in candidatos(html, url_atual):
             try:
                 return stream_download(link, pasta, sess=sess,
+                                       nome=nome_arquivo,
                                        referer=url_atual, force=force)
             except RespostaHTML:
                 continue  # não era o arquivo; tenta o próximo candidato
@@ -282,11 +382,59 @@ def baixar_xfs(url, pasta, *, sess=None, html_inicial=None, force=False):
         alvo = urljoin(url_atual, formulario["action"]) or url_atual
         log(f"   ↳ etapa {etapa}: enviando formulário "
             f"(op={formulario['campos'].get('op', '?')})")
-        resp = sess.post(alvo, data=formulario["campos"],
-                         timeout=CONFIG["timeout"], allow_redirects=True)
-        resp.raise_for_status()
-        html = resp.text
-        url_atual = str(resp.url)
+        try:
+            resp = sess.post(alvo, data=formulario["campos"],
+                             timeout=CONFIG["timeout"], allow_redirects=False)
+        except requests.exceptions.RequestException as exc:
+            raise DownloadError(erro_rede(exc, alvo)) from exc
+
+        local = (resp.headers.get("Location") or "").strip()
+        if 300 <= resp.status_code < 400 and local:
+            # O XFS termina o fluxo com um redirect: o link direto vem no
+            # cabeçalho Location (o corpo não é a página do próximo passo).
+            proximo = urljoin(url_atual, local)
+            if "op=" in proximo.lower():
+                # Aponta para o passo XFS seguinte: segue o fluxo.
+                html = None
+                url_atual = proximo
+                continue
+            try:
+                return stream_download(proximo, pasta, sess=sess,
+                                       nome=nome_arquivo,
+                                       referer=url_atual, force=force)
+            except RespostaHTML:
+                # Não era o arquivo: continua o fluxo a partir dessa página.
+                try:
+                    resp2 = sess.get(proximo, timeout=CONFIG["timeout"],
+                                     allow_redirects=True)
+                except requests.exceptions.RequestException as exc:
+                    raise DownloadError(erro_rede(exc, proximo)) from exc
+                if resp2.status_code == 404:
+                    raise DownloadError(
+                        "O arquivo não existe mais (HTTP 404).")
+                try:
+                    resp2.raise_for_status()
+                except requests.exceptions.HTTPError as exc:
+                    raise DownloadError(
+                        f"O servidor devolveu HTTP {resp2.status_code} "
+                        f"ao abrir {proximo}."
+                    ) from exc
+                html = resp2.text
+                url_atual = str(resp2.url)
+                continue
+        else:
+            if resp.status_code == 404:
+                raise DownloadError(
+                    "O arquivo não existe mais (HTTP 404).")
+            try:
+                resp.raise_for_status()
+            except requests.exceptions.HTTPError as exc:
+                raise DownloadError(
+                    f"O servidor devolveu HTTP {resp.status_code} "
+                    f"na etapa {etapa} ({url_atual})."
+                ) from exc
+            html = resp.text
+            url_atual = str(resp.url)
 
     if motivo is None:
         motivo = ("Percorri todas as etapas e nenhuma página trouxe o link "
@@ -300,7 +448,7 @@ def baixar_xfs(url, pasta, *, sess=None, html_inicial=None, force=False):
 
 
 class XFileSharing:
-    NOME = "XFileSharing (Sharemods, DDownload e similares)"
+    NOME = "XFileSharing (Sharemods e similares)"
     DOMINIOS = DOMINIOS_XFS
 
     @staticmethod

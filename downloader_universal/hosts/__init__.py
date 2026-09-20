@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from ..utils import dominio, parece_link_direto
+from .ddownload import DDownload
 from .generico import Direto, Generico
 from .gdrive import GDrive
 from .mediafire import MediaFire
@@ -12,7 +13,11 @@ from .rapidgator import RapidGator
 from .xfilesharing import XFileSharing
 
 #: Ordem de prioridade: hosts específicos primeiro.
-EXTRATORES = [MediaFire, GDrive, RapidGator, MegaHost, OneDrive, XFileSharing]
+#: (DDownload antes de XFileSharing: usa a API pública + o motor XFS.)
+EXTRATORES = [
+    MediaFire, GDrive, RapidGator, MegaHost, OneDrive, DDownload,
+    XFileSharing,
+]
 
 
 def detectar(url: str):
