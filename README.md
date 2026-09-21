@@ -114,6 +114,7 @@ baixar("https://sharemods.com/abcdef/mod.zip.html", pasta="meus_arquivos")
 |---|---|
 | DDownload: captcha / `Cloudflare Turnstile` | Abra o link original no navegador e conclua o download por lá. A API pública só consulta metadados; não resolve captchas. IP residencial não garante sucesso e o projeto não implementa login premium do DDownload |
 | DDownload aparece como `XFileSharing` no log | Código antigo em disco ou na memória do Colab. Atualize o projeto e reinicie a sessão, conforme as instruções abaixo |
+| Sharemods: `HTTP 403 Forbidden` | Atualize o projeto e reinicie a sessão do Colab. O XFS agora usa cabeçalhos de navegador e tenta aquecer cookies antes de desistir. Se persistir, o próprio Sharemods bloqueou o IP/rede ou exige verificação no navegador |
 | `skipped countdown` | O servidor recusou a contagem regressiva; não significa necessariamente captcha. Atualize o projeto. Se persistir, o HTML de diagnóstico ajuda a identificar o contador ou a verificação de sessão não reconhecidos |
 | DDownload: `erro de rede/SSL` no handshake TLS | Pode ser bloqueio de IP ou instabilidade de rede/servidor; esse erro, sozinho, não prova a causa. Tente mais tarde ou abra no navegador |
 | `RapidGator bloqueia download automático` | É necessário conta **premium** + `configurar(rapidgator_usuario=..., rapidgator_senha=...)` |

@@ -307,6 +307,96 @@ def formularios_download(html):
     return formularios
 
 
+def _origem(url):
+    """Origem ``scheme://host`` usada em cabeçalhos de navegador."""
+    partes = urlparse(url)
+    if not partes.scheme or not partes.netloc:
+        return ""
+    return f"{partes.scheme}://{partes.netloc}"
+
+
+def _cabecalhos_navegador(url, referer=None, *, navegacao=True):
+    """Cabeçalhos mais próximos de um navegador real para páginas XFS.
+
+    Alguns hosts (especialmente o Sharemods) começaram a devolver HTTP 403
+    para requisições de página com cabeçalhos muito genéricos ou com Referer
+    artificial na primeira visita. Mantemos o User-Agent da sessão, mas
+    deixamos cada requisição de página/formulário carregar o Referer correto.
+    """
+    headers = {
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,"
+            "image/avif,image/webp,image/apng,*/*;q=0.8"
+        ),
+        "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin" if referer else "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+    }
+    if referer:
+        headers["Referer"] = referer
+    if not navegacao:
+        headers["Origin"] = _origem(url)
+        headers["Sec-Fetch-User"] = "?0"
+    return headers
+
+
+def _raise_status_pagina(resp, url):
+    """Converte erro HTTP de página XFS em mensagem mais útil."""
+    status = int(getattr(resp, "status_code", 0) or 0)
+    if status < 400:
+        return
+    causa = None
+    try:
+        resp.raise_for_status()
+    except requests.exceptions.HTTPError as exc:
+        causa = exc
+    if status == 403:
+        raise DownloadError(
+            "O servidor devolveu HTTP 403 (Forbidden) ao abrir "
+            f"{url}. O host recusou a requisição antes de mostrar a "
+            "página do arquivo. Em Sharemods isso costuma ser bloqueio "
+            "anti-bot/anti-datacenter ou exigência de navegação real; "
+            "tente novamente, use outra rede/IP, ou abra o link no "
+            "navegador para verificar se há desafio/captcha."
+        ) from causa
+    raise DownloadError(
+        f"O servidor devolveu HTTP {status} ao abrir {url}."
+    ) from causa
+
+
+def _get_pagina(sess, url, *, referer=None):
+    """Abre uma página XFS com headers de navegador e aquecimento em 403.
+
+    A primeira visita não envia Referer artificial. Se o host negar com 403,
+    fazemos uma visita leve à página inicial para obter cookies e tentamos mais
+    uma vez. Isso ajuda hosts XFS que protegem a página do arquivo, sem tentar
+    burlar captcha/desafios interativos.
+    """
+    headers = _cabecalhos_navegador(url, referer=referer)
+    resp = sess.get(url, headers=headers, timeout=CONFIG["timeout"],
+                    allow_redirects=True)
+    if resp.status_code != 403:
+        return resp
+
+    origem = _origem(url)
+    if origem:
+        try:
+            sess.get(origem + "/", headers=_cabecalhos_navegador(origem + "/"),
+                     timeout=min(int(CONFIG["timeout"]), 15),
+                     allow_redirects=True)
+        except requests.exceptions.RequestException:
+            pass
+        resp.close()
+        resp = sess.get(url, headers=headers, timeout=CONFIG["timeout"],
+                        allow_redirects=True)
+    return resp
+
+
 def baixar_xfs(url, pasta, *, sess=None, html_inicial=None, force=False,
                nome_arquivo=None):
     """Baixa um arquivo percorrendo as etapas XFS até achar o link direto.
@@ -315,7 +405,7 @@ def baixar_xfs(url, pasta, *, sess=None, html_inicial=None, force=False,
     a API do site já informa o nome correto.
     """
     sess = sess or sessao()
-    sess.headers["Referer"] = url
+    sess.headers.pop("Referer", None)
 
     html = html_inicial
     url_atual = url
@@ -326,21 +416,14 @@ def baixar_xfs(url, pasta, *, sess=None, html_inicial=None, force=False,
     for etapa in range(1, 8):
         if html is None:
             try:
-                resp = sess.get(url_atual, timeout=CONFIG["timeout"],
-                                allow_redirects=True)
+                resp = _get_pagina(sess, url_atual)
             except requests.exceptions.RequestException as exc:
                 raise DownloadError(erro_rede(exc, url_atual)) from exc
             if resp.status_code == 404:
                 raise DownloadError(
                     "O arquivo não existe mais (HTTP 404) — "
                     "o link foi removido ou expirou.")
-            try:
-                resp.raise_for_status()
-            except requests.exceptions.HTTPError as exc:
-                raise DownloadError(
-                    f"O servidor devolveu HTTP {resp.status_code} "
-                    f"ao abrir {url_atual}."
-                ) from exc
+            _raise_status_pagina(resp, url_atual)
             html = resp.text
             url_atual = str(resp.url)
 
@@ -420,8 +503,14 @@ def baixar_xfs(url, pasta, *, sess=None, html_inicial=None, force=False,
         log(f"   ↳ etapa {etapa}: enviando formulário "
             f"(op={formulario['campos'].get('op', '?')})")
         try:
-            resp = sess.post(alvo, data=formulario["campos"],
-                             timeout=CONFIG["timeout"], allow_redirects=False)
+            resp = sess.post(
+                alvo,
+                data=formulario["campos"],
+                headers=_cabecalhos_navegador(alvo, referer=url_atual,
+                                              navegacao=False),
+                timeout=CONFIG["timeout"],
+                allow_redirects=False,
+            )
         except requests.exceptions.RequestException as exc:
             raise DownloadError(erro_rede(exc, alvo)) from exc
 
@@ -442,20 +531,13 @@ def baixar_xfs(url, pasta, *, sess=None, html_inicial=None, force=False,
             except RespostaHTML:
                 # Não era o arquivo: continua o fluxo a partir dessa página.
                 try:
-                    resp2 = sess.get(proximo, timeout=CONFIG["timeout"],
-                                     allow_redirects=True)
+                    resp2 = _get_pagina(sess, proximo, referer=url_atual)
                 except requests.exceptions.RequestException as exc:
                     raise DownloadError(erro_rede(exc, proximo)) from exc
                 if resp2.status_code == 404:
                     raise DownloadError(
                         "O arquivo não existe mais (HTTP 404).")
-                try:
-                    resp2.raise_for_status()
-                except requests.exceptions.HTTPError as exc:
-                    raise DownloadError(
-                        f"O servidor devolveu HTTP {resp2.status_code} "
-                        f"ao abrir {proximo}."
-                    ) from exc
+                _raise_status_pagina(resp2, proximo)
                 html = resp2.text
                 url_atual = str(resp2.url)
                 continue

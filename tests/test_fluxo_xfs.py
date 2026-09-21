@@ -126,6 +126,34 @@ class FluxoXFS(unittest.TestCase):
                 self.assertIn("captcha", msg)
                 self.assertNotIn("contagem regressiva", msg)
 
+    def test_primeiro_get_nao_envia_referer_artificial(self):
+        self.sess.headers["Referer"] = "https://sharemods.com/antigo"
+        self.sess.get.return_value = resposta(
+            '<a href="https://srv1.sharemods.com/d/t/a.zip">Download [1 MB]</a>'
+        )
+        resultado = xfs.baixar_xfs("https://sharemods.com/abc/mod.zip.html",
+                                   "downloads", sess=self.sess)
+        self.assertEqual(resultado, self.stream_download.return_value)
+        self.assertNotIn("Referer", self.sess.headers)
+        headers = self.sess.get.call_args.kwargs["headers"]
+        self.assertNotIn("Referer", headers)
+        self.assertEqual(headers["Sec-Fetch-Site"], "none")
+
+    def test_403_faz_aquecimento_e_explica_bloqueio_sharemods(self):
+        self.sess.get.side_effect = [
+            resposta("Forbidden", status=403),
+            resposta("home", status=200),
+            resposta("Forbidden", status=403),
+        ]
+        with self.assertRaisesRegex(DownloadError, "HTTP 403.*Sharemods"):
+            xfs.baixar_xfs("https://sharemods.com/abc/mod.zip.html",
+                           "downloads", sess=self.sess)
+        chamadas = self.sess.get.call_args_list
+        self.assertEqual(len(chamadas), 3)
+        self.assertEqual(chamadas[1].args[0], "https://sharemods.com/")
+        self.assertNotIn("Referer", chamadas[0].kwargs["headers"])
+        self.assertNotIn("Referer", chamadas[2].kwargs["headers"])
+
 
 class OrientacaoDDownload(unittest.TestCase):
     @patch("downloader_universal.hosts.ddownload.sessao")
